@@ -1,3 +1,5 @@
+{-# LANGUAGE FlexibleContexts #-}
+
 module Dropbox (
     -- * Configuration
     mkConfig,
@@ -12,7 +14,7 @@ module Dropbox (
     Locale,
     localeEn, localeEs, localeFr, localeDe, localeJp,
     AccessType(..),
-    -- * Manager
+    -- * HTTP connection manager
     Manager,
     withManager,
     -- * OAuth
@@ -23,23 +25,21 @@ module Dropbox (
     Session(..),
     -- * Get user account info
     getAccountInfo, AccountInfo(..),
-    -- * Basic file access API
-    -- ** Get metadata
+    -- * Get file/folder metadata
     getMetadata, getMetadataWithChildren, getMetadataWithChildrenIfChanged,
     Meta(..), MetaBase(..), MetaExtra(..), FolderContents(..), FileExtra(..),
     FolderHash(..), FileRevision(..),
-    -- ** Uploading files
-    addFile, forceFile, updateFile,
+    -- * Upload/download files
+    getFile, getFileBs,
+    putFile, WriteMode(..),
     -- * Common data types
     fileRevisionToString, folderHashToString,
     ErrorMessage, URL, Path,
-    RequestBody, bsRequestBody
+    RequestBody(..), bsRequestBody, bsSink,
 ) where
 
 {-
 TODO:
-- The JSON we get from the server sometimes has numbers encoded as strings
-  Make sure we handle that case.
 - Proper return values for 404, 406, oauth unlinked, etc.
 -}
 
@@ -52,30 +52,27 @@ import qualified Text.JSON as JSON
 import Text.JSON (JSON, readJSON, showJSON)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Char8 as BS8
 import Data.Word (Word64)
 import Data.Int (Int64)
-import Data.List (isPrefixOf)
-import Data.Time.Clock (UTCTime(utctDay), getCurrentTime)
+import Data.Time.Clock (UTCTime)
 import Data.Time.Format (parseTime, formatTime)
 import System.Locale (defaultTimeLocale)
 import Control.Monad (liftM)
-import qualified Data.Enumerator as E
-import qualified Data.Enumerator.List as EL
-import qualified Network.HTTP.Enumerator as HE
+import Control.Monad.IO.Class (MonadIO)
+import Control.Monad.Trans.Control (MonadBaseControl)
+import Control.Monad.Trans.Resource (ResourceT, MonadUnsafeIO, MonadThrow, MonadResource(..), runResourceT, allocate)
+import Data.Conduit (Sink, Source, ($=), ($$+-))
+import qualified Data.Conduit.List as CL
+import qualified Network.HTTP.Conduit as HC
 import qualified Network.HTTP.Types as HT
-import qualified Network.TLS as TLS
-import qualified Network.TLS.Extra as TLSExtra
-import Data.Certificate.X509 (X509)
-import qualified Data.Certificate.X509 as X509
-import Data.Certificate.PEM as PEM
-import Data.Enumerator (Iteratee, Enumerator)
+import qualified Network.HTTP.Types.Header as HT
 import qualified Blaze.ByteString.Builder.ByteString as BlazeBS
-import System.IO as IO
-import qualified Paths_dropbox_sdk as Paths
+
+import Dropbox.Certificates
 
 type ErrorMessage = String
+
 type URL = String
 
 -- |Dropbox file and folder paths.  Should always start with "/".
@@ -86,10 +83,10 @@ apiVersion = "1"
 -- |The type of folder access your Dropbox application uses (<https://www.dropbox.com/developers/start/core>).
 data AccessType
     = AccessTypeDropbox   -- ^Full access to the user's entire Dropbox
-    | AccessTypeAppFolder -- ^Access to an application-specific "app folder" within the user's Dropbox
+    | AccessTypeAppFolder -- ^Access to an application-specific \"app folder\" within the user's Dropbox
     deriving (Show, Eq)
 
--- |Your application's Dropbox "app key" and "app secret".
+-- |Your application's Dropbox \"app key\" and \"app secret\".
 data AppId = AppId String String deriving (Show, Eq)
 
 -- |An OAuth request token (returned by 'authStart')
@@ -124,51 +121,37 @@ hostsDefault = Hosts
 -- |Specifies a locale (the string is a two-letter locale code)
 newtype Locale = Locale String deriving (Show, Eq)
 
--- |The English (American) locale ("en").
+-- |English (American) (\"en\").
 localeEn :: Locale
 localeEn = Locale "en"
 
--- |The Spanish locale (@'Locale' "es"@).
+-- |Spanish (\"es\").
 localeEs :: Locale
 localeEs = Locale "es"
 
--- |The French locale (Locale "fr").
+-- |French (\"fr\").
 localeFr :: Locale
 localeFr = Locale "fr"
 
--- |The German locale (Locale "de").
+-- |German (\"de\").
 localeDe :: Locale
 localeDe = Locale "de"
 
--- |The Japanese locale (Locale "jp").
+-- |Japanese (\"jp\").
 localeJp :: Locale
 localeJp = Locale "jp"
 
--- |The configuration used to make authentication calls and API calls.  You typically create
+-- |The configuration used to make API calls.  You typically create
 -- one of these via the 'config' helper function.
 data Config = Config
     { configHosts :: Hosts           -- ^The hosts to connect to (just use 'hostsDefault').
     , configUserLocale :: Locale     -- ^The locale that the Dropbox service should use when returning user-visible strings.
     , configAppId :: AppId           -- ^Your app's key/secret
     , configAccessType :: AccessType -- ^The type of folder access your Dropbox application uses.
-    , configCertVerifier :: CertVerifier -- ^The server certificate validation routine.
     } deriving (Show)
 
-type CertVerifierFunc =
-    HT.Ascii                       -- ^The server's host name.
-    -> [X509]                      -- ^The server's certificate chain.
-    -> IO TLS.TLSCertificateUsage  -- ^Whether the certificate chain is valid or not.
-
--- |How the server's SSL certificate will be verified.
-data CertVerifier = CertVerifier
-    { certVerifierName :: String -- ^The human-friendly name of the policy (only for debug prints)
-    , certVerifierFunc :: CertVerifierFunc -- ^The function that implements certificate validation.
-    }
-
-instance Show CertVerifier where
-    show (CertVerifier name _) = "CertVerifier " ++ show name
-
--- |A convenience function that constructs a 'Config'
+-- |A convenience function that constructs a 'Config'.  It's in the 'IO' monad because we read from
+-- a file to get the list of trusted SSL certificates, which is used to verify the server over SSL.
 mkConfig ::
     Locale
     -> String      -- ^Your Dropbox app key
@@ -176,18 +159,11 @@ mkConfig ::
     -> AccessType  -- ^'configAccessType'
     -> IO Config
 mkConfig userLocale appKey appSecret accessType = do
-    caFile <- Paths.getDataFileName "trusted-certs.crt"
-    vf <- do
-        r <- certVerifierFromPemFile caFile
-        case r of
-            Right vf -> return $ vf
-            Left err -> fail $ "Unable to load root certificates from " ++ (show caFile) ++ ": " ++ err
     return $ Config
         { configHosts = hostsDefault
         , configUserLocale = userLocale
         , configAppId = AppId appKey appSecret
         , configAccessType = accessType
-        , configCertVerifier = vf
         }
 
 -- |Contains a 'Config' and an 'AccessToken'.  Every API call (after OAuth is complete)
@@ -196,81 +172,6 @@ data Session = Session
     { sessionConfig :: Config
     , sessionAccessToken :: AccessToken  -- ^The 'AccessToken' obtained from 'authFinish'
     }
-
-----------------------------------------------------------------------
--- SSL Certificate Validation
-
--- |A dummy implementation that doesn't perform any verification.
-certVerifierInsecure :: CertVerifier
-certVerifierInsecure = CertVerifier "insecure" (\_ _ -> return TLS.CertificateUsageAccept)
-
-rightsOrFirstLeft :: [Either a b] -> Either a [b]
-rightsOrFirstLeft = foldr f (Right [])
-    where
-        f (Left e) _ = Left e
-        f _ (Left e) = Left e
-        f (Right v) (Right vs) = Right (v:vs)
-
--- |Reads certificates in PEM format from the given file and uses those as the roots when
--- verifying certificates.  This function basically just loads the certificates and delegates
--- to 'certVerifierFromRootCerts' for the actual checking.
-certVerifierFromPemFile :: FilePath -> IO (Either ErrorMessage CertVerifier)
-certVerifierFromPemFile filePath = do
-    raw <- withFile filePath IO.ReadMode BS.hGetContents
-    let pems = PEM.parsePEMs raw
-    let es = [X509.decodeCertificate (LBS.fromChunks [stuff]) | (_, stuff) <- pems]
-    case rightsOrFirstLeft es of
-        Left err -> return $ Left err
-        Right x509s -> return $ Right $ CertVerifier ("PEM file: " ++ show filePath) (certVerifierFromRootCerts x509s)
-
-certAll :: [IO TLS.TLSCertificateUsage] -> IO TLS.TLSCertificateUsage
-certAll [] = return TLS.CertificateUsageAccept
-certAll (head:rest) = do
-    r <- head
-    case r of
-        TLS.CertificateUsageAccept -> certAll rest
-        reject -> return $ reject
-
--- |Given a set of root certificates, yields a certificate validation function.
-certVerifierFromRootCerts ::
-    [X509]            -- ^The set of trusted root certificates.
-    -> HT.Ascii       -- ^The remove server's domain name.
-    -> [X509]         -- ^The certificate chain provided by the remote server.
-    -> IO TLS.TLSCertificateUsage
--- TODO: Rewrite this crappy code.  SSL cert checking needs to be more correct than this.
-certVerifierFromRootCerts roots domain chain = do
-        utcTime <- getCurrentTime
-        let day = utctDay utcTime
-        certAll
-            [ return $ TLSExtra.certificateVerifyDomain (BS8.unpack domain) chain
-            , checkTrustChain day chain
-            ]
-    where
-        checkTrustChain _ [] = return $ TLS.CertificateUsageReject $ TLS.CertificateRejectOther "empty chain"
-        checkTrustChain day (head:rest) = do
-            if isUnexpired day head
-                then do
-                    issuerMatch <- mapM (head `isIssuedBy`) roots
-                    if any (== True) issuerMatch
-                        then return $ TLS.CertificateUsageAccept
-                        else case rest of
-                            [] -> return $ TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
-                            (next:_) -> do
-                                nextOk <- TLSExtra.certificateVerifyAgainst head next
-                                if nextOk
-                                    then checkTrustChain day rest
-                                    else return $ TLS.CertificateUsageReject $ TLS.CertificateRejectOther "break in verification chain"
-                else return $ TLS.CertificateUsageReject $ TLS.CertificateRejectExpired
-        isIssuedBy :: X509 -> X509 -> IO Bool
-        isIssuedBy c issuer =
-            if subjectDN issuer == issuerDN c
-                then TLSExtra.certificateVerifyAgainst c issuer
-                else return False
-        subjectDN c = X509.certSubjectDN $ X509.x509Cert c
-        issuerDN c = X509.certIssuerDN $ X509.x509Cert c
-        isUnexpired day cert =
-            let ((beforeDay, _, _), (afterDay, _, _)) = X509.certValidity (X509.x509Cert cert)
-            in beforeDay < day && day <= afterDay
 
 ----------------------------------------------------------------------
 -- Authentication/Authorization
@@ -301,7 +202,7 @@ authStart ::
     -> Maybe URL -- ^The callback URL (optional)
     -> IO (Either ErrorMessage (RequestToken, URL))
 authStart mgr config callback = do
-    result <- httpClientGet mgr vf uri oauthHeader (mkHandler handler)
+    result <- httpClientGet mgr uri oauthHeader (mkHandler handler)
     return $ mergeLefts result
     where
         Locale locale = configUserLocale config
@@ -310,7 +211,9 @@ authStart mgr config callback = do
         consumerPair = configAppId config
         uri = "https://" ++ host ++ ":443/" ++ apiVersion ++ "/oauth/request_token?locale=" ++ urlEncode locale
         oauthHeader = buildOAuthHeaderNoToken consumerPair
-        vf = certVerifierFunc $ configCertVerifier config
+
+        -- The handler is a callback that is executed on the response
+        -- In case the OK:
         handler 200 _ body = do
             let sBody = UTF8.toString body  -- toString should return a Maybe, but it doesn't.  You too, Haskell?
             case parseTokenParts sBody of
@@ -318,10 +221,13 @@ authStart mgr config callback = do
                 Right requestToken@(RequestToken requestTokenKey _) -> do
                     let authorizeUrl = "https://" ++ webHost ++ "/"++apiVersion++"/oauth/authorize?locale=" ++ urlEncode locale ++ "&oauth_token=" ++ urlEncode requestTokenKey ++ callbackSuffix
                     Right (requestToken, authorizeUrl)
+        -- In case of an error:
         handler code reason body = Left $ "server returned " ++ show code ++ ": " ++ show reason ++ ": " ++ show body
+        
         callbackSuffix = case callback of
             Nothing -> ""
             Just callbackUrl -> "&oauth_callback=" ++ urlEncode callbackUrl
+        
         parseTokenParts :: String -> Either String RequestToken
         parseTokenParts s = do
             enc <- URLEncoded.importString s
@@ -333,13 +239,13 @@ authStart mgr config callback = do
 -- and the user has authorized your app, call this function to get a 'RequestToken', which
 -- is used to make Dropbox API calls.
 authFinish ::
-    Manager       -- ^The HTTP connection manager to use.
+    Manager          -- ^The HTTP connection manager to use.
     -> Config
     -> RequestToken  -- ^The 'RequestToken' obtained from 'authStart'
     -> IO (Either ErrorMessage (AccessToken, String))
         -- ^The 'AccessToken' used to make Dropbox API calls and the user's Dropbox user ID.
 authFinish mgr config (RequestToken rtKey rtSecret) = do
-    result <- httpClientGet mgr vf uri oauthHeader (mkHandler handler)
+    result <- httpClientGet mgr uri oauthHeader (mkHandler handler)
     return $ mergeLefts result
     where
         host = hostsApi (configHosts config)
@@ -347,7 +253,6 @@ authFinish mgr config (RequestToken rtKey rtSecret) = do
         consumerPair = configAppId config
         uri = "https://" ++ host ++ ":443/"++apiVersion++"/oauth/access_token?locale=" ++ urlEncode locale
         oauthHeader = buildOAuthHeader consumerPair (rtKey, rtSecret)
-        vf = certVerifierFunc $ configCertVerifier config
         handler 200 _ body = do
             let sBody = UTF8.toString body  -- toString should return a Maybe, but it doesn't.  You too, Haskell?
             case parseResponse sBody of
@@ -479,16 +384,16 @@ data Meta = Meta MetaBase MetaExtra
 -- |Metadata common to both files and folders.
 data MetaBase = MetaBase
     { metaRoot :: AccessType  -- ^Matches the 'AccessType' of the app that retrieved the metadata.
-    , metaPath :: String      -- ^The full path (starting with a "/") of the file or folder, relative to 'metaRoot'
+    , metaPath :: String      -- ^The full path (starting with a \"/\") of the file or folder, relative to 'metaRoot'
     , metaIsDeleted :: Bool   -- ^Whether this metadata entry refers to a file that had been deleted when the entry was retrieved.
     , metaThumbnail :: Bool   -- ^Will be @True@ if this file might have a thumbnail, and @False@ if it definitely doesn't.
     , metaIcon :: String      -- ^The name of the icon used to illustrate this file type in Dropbox's icon library (<https://www.dropbox.com/static/images/dropbox-api-icons.zip>).
     } deriving (Eq, Show)
 
--- |Metadata that's specific to either files or folders.
+-- |Extra metadata (in addition to the stuff that's common to files and folders).
 data MetaExtra
     = File FileExtra    -- ^Files have additional metadata
-    | Folder            -- ^Folders do not
+    | Folder            -- ^Folders do not have any additional metadata
     deriving (Eq, Show)
 
 -- |Represents a file's revision ('fileRevision').
@@ -503,15 +408,15 @@ data FileExtra = FileExtra
     , fileModified :: UTCTime      -- ^When this file was added or last updated
     } deriving (Eq, Show)
 
--- |Represents an identifier for a folder's metadata and contents.  Can be used with
--- 'getMetadataWithChildrenIfChanged' to avoid downloading a folder's metadata and contents
+-- |Represents an identifier for a folder's metadata and children's metadata.  Can be used with
+-- 'getMetadataWithChildrenIfChanged' to avoid downloading a folder's metadata and children's metadata
 -- if it hasn't changed.
 newtype FolderHash = FolderHash String deriving (Eq, Show)
 folderHashToString (FolderHash s) = s
 
--- |The single-level contents of a folder.
+-- |The metadata for the immediate children of a folder.
 data FolderContents = FolderContents
-    { folderHash :: FolderHash  -- ^An identifier for the folder's metadata and contents.
+    { folderHash :: FolderHash  -- ^An identifier for the folder's metadata and children's metadata.
     , folderChildren :: [Meta]  -- ^The metadata for the immediate children of a folder.
     } deriving (Eq, Show)
 
@@ -597,18 +502,20 @@ instance JSON MetaWithChildren where
 ----------------------------------------------------------------------
 -- GetMetadata
 
+checkPath :: Monad m => Path -> m (Either ErrorMessage a) -> m (Either ErrorMessage a)
+checkPath ('/':_) action = action
+checkPath _ _            = return $ Left $ "path must start with \"/\""
+
 -- |Get the metadata for the file or folder at the given path.
 getMetadata ::
-    Manager    -- ^The HTTP connection manager to use.
+    (MonadBaseControl IO m, MonadThrow m, MonadUnsafeIO m, MonadIO m) 
+    => Manager    -- ^The HTTP connection manager to use.
     -> Session
     -> Path      -- ^The full path (relative to your 'DbAccessType' root)
-    -> IO (Either ErrorMessage Meta)
-getMetadata mgr session path = do
-    if "/" `isPrefixOf` path
-        then do
-            result <- doGet mgr session hostsApi url params (mkHandler handler)
-            return $ mergeLefts result
-        else return $ Left $ "path must start with \"/\""
+    -> m (Either ErrorMessage Meta)
+getMetadata mgr session path = checkPath path $ do
+    result <- doGet mgr session hostsApi url params (mkHandler handler)
+    return $ mergeLefts result
     where
         at = accessTypePath $ configAccessType (sessionConfig session)
         url = "metadata/" ++ at ++ path
@@ -617,23 +524,21 @@ getMetadata mgr session path = do
         handler code reason body = Left $ "non-200 response from Dropbox (" ++ (show code) ++ ":" ++ reason ++ ": " ++ (show body) ++ ")"
 
 -- |Get the metadata for the file or folder at the given path.  If it's a folder,
--- return the first-level folder contents' metadata entries as well.
+-- return the metadata for the folder's immediate children as well.
 getMetadataWithChildren ::
-    Manager    -- ^The HTTP connection manager to use.
+    (MonadBaseControl IO m, MonadThrow m, MonadUnsafeIO m, MonadIO m) 
+    => Manager    -- ^The HTTP connection manager to use.
     -> Session
-    -> Path      -- ^The full path (relative to your 'DbAccessType' root)
+    -> Path       -- ^The full path (relative to your 'DbAccessType' root)
     -> Maybe Integer
-        -- ^A limit on folder contents (max: 10,000).  If the path refers to a folder and this folder
-        -- has more than the specified number of immediate children, the entire
-        -- 'getMetadataWithChildren' call will fail with an HTTP 406 error code.  If unspecified, or
-        -- if set to zero, the server will set this to 10,000.
-    -> IO (Either ErrorMessage (Meta, Maybe FolderContents))
-getMetadataWithChildren mgr session path childLimit = do
-    if "/" `isPrefixOf` path
-        then do
-            result <- doGet mgr session hostsApi url params (mkHandler handler)
-            return $ mergeLefts result
-        else return $ Left $ "'path' must start with \"/\""
+                  -- ^A limit on folder contents (max: 10,000).  If the path refers to a folder and this folder
+                  -- has more than the specified number of immediate children, the entire
+                  -- 'getMetadataWithChildren' call will fail with an HTTP 406 error code.  If unspecified, or
+                  -- if set to zero, the server will set this to 10,000.
+    -> m (Either ErrorMessage (Meta, Maybe FolderContents))
+getMetadataWithChildren mgr session path childLimit = checkPath path $ do
+    result <- doGet mgr session hostsApi url params (mkHandler handler)
+    return $ mergeLefts result
     where
         at = accessTypePath $ configAccessType (sessionConfig session)
         url = "metadata/" ++ at ++ path
@@ -646,22 +551,19 @@ getMetadataWithChildren mgr session path childLimit = do
 -- |Same as 'getMetadataWithChildren' except it'll return @Nothing@ if the 'FolderHash'
 -- of the folder on Dropbox is the same as the 'FolderHash' passed in.
 getMetadataWithChildrenIfChanged ::
-    Manager           -- ^The HTTP connection manager to use.
+    (MonadBaseControl IO m, MonadThrow m, MonadUnsafeIO m, MonadIO m) 
+    => Manager       -- ^The HTTP connection manager to use.
     -> Session
     -> Path
-    -> Maybe Integer
-    -> FolderHash
-        -- ^For folders, the returned child metadata will include a 'folderHash' field that
-        -- is a short identifier for the current state of the folder.  If the 'FolderHash'
-        -- for the specified path hasn't change, this call will return @Nothing@, which
-        -- indicates that the previously-retrieved metadata is still the latest.
-    -> IO (Either ErrorMessage (Maybe (Meta, Maybe FolderContents)))
-getMetadataWithChildrenIfChanged mgr session path childLimit (FolderHash hash) = do
-    if "/" `isPrefixOf` path
-        then do
-            result <- doGet mgr session hostsApi url params (mkHandler handler)
-            return $ mergeLefts result
-        else return $ Left $ "'path' must start with \"/\""
+    -> Maybe Integer 
+    -> FolderHash    -- ^For folders, the returned child metadata will include a 'folderHash' field that
+                     -- is a short identifier for the current state of the folder.  If the 'FolderHash'
+                     -- for the specified path hasn't change, this call will return @Nothing@, which
+                     -- indicates that the previously-retrieved metadata is still the latest.
+    -> m (Either ErrorMessage (Maybe (Meta, Maybe FolderContents)))
+getMetadataWithChildrenIfChanged mgr session path childLimit (FolderHash hash) = checkPath path $ do
+    result <- doGet mgr session hostsApi url params (mkHandler handler)
+    return $ mergeLefts result
     where
         at = accessTypePath $ configAccessType (sessionConfig session)
         url = "metadata/" ++ at ++ path
@@ -673,63 +575,79 @@ getMetadataWithChildrenIfChanged mgr session path childLimit (FolderHash hash) =
         handler code reason body = Left $ "non-200 response from Dropbox (" ++ (show code) ++ ":" ++ reason ++ ": " ++ (show body) ++ ")"
 
 ----------------------------------------------------------------------
--- AddFile/ForceFile/UpdateFile
+-- GetFile
 
--- |Add a new file.  If a file or folder already exists at the given path, your
--- file will be automatically renamed.  If successful, you'll get back the metadata
--- for your newly-uploaded file.
-addFile ::
-    Manager    -- ^The HTTP connection manager to use.
+-- |Gets a file's contents and metadata.  If you just want the entire contents of
+-- a file as a single 'ByteString', use 'getFileBs'.
+getFile ::
+    (MonadBaseControl IO m, MonadThrow m, MonadUnsafeIO m, MonadIO m)
+    => Manager               -- ^The HTTP connection manager to use.
     -> Session
-    -> Path        -- ^The full path (relative to your 'DbAccessType' root)
-    -> RequestBody -- ^The file contents.
-    -> IO (Either ErrorMessage Meta)
-addFile mgr session path contents = putFile mgr session path contents [("overwrite", "false")]
+    -> Path               -- ^The full path (relative to your 'DbAccessType' root)
+    -> Maybe FileRevision -- ^The revision of the file to retrieve.
+    -> (Meta -> Sink ByteString (ResourceT m) r)
+                          -- ^Given the file metadata, yield a 'Sink' to process the response body
+    -> m (Either ErrorMessage (Meta, r))
+                          -- ^This function returns whatever your 'Sink' returns, paired up with the file metadata.
+getFile mgr session path mrev sink = checkPath path $ do
+    result <- doGet mgr session hostsApiContent url params handler
+    return $ mergeLefts result
+    where
+        at = accessTypePath $ configAccessType (sessionConfig session)
+        url = "files/" ++ at ++ path
+        params = maybe [] (\(FileRevision rev) -> [("rev", rev)]) mrev
 
--- |Overwrite a file, assuming it is the version you expect.  Specify the version
--- you expect with the 'FileRevision'.  If the file on Dropbox matches the given
--- revision, the file will be replaced with the contents you specify.  If the file
--- on Dropbox doesn't have the specified revision, it will be left alone and your
--- file will be automatically renamed.  If successful, you'll get back the metadata
--- for your newly-uploaded file.
-updateFile ::
-    Manager    -- ^The HTTP connection manager to use.
-    -> Session
-    -> Path         -- ^The full path (relative to your 'DbAccessType' root)
-    -> RequestBody  -- ^The file contents.
-    -> FileRevision -- ^The revision of the file you expect to be writing to.
-    -> IO (Either ErrorMessage Meta)
-updateFile mgr session path contents (FileRevision rev) =
-    putFile mgr session path contents [("parent_rev", rev)]
+        handler (HT.Status 200 _) headers = case getHeaders "X-Dropbox-Metadata" headers of
+            [metaJson] -> case handleJsonBody metaJson of
+                Left err -> return (Left err)
+                Right meta -> do
+                    r <- sink meta
+                    return $ Right (meta, r)
+            l -> return $ Left $ "expecting response to have exactly one \"X-Dropbox-Metadata\" header, found " ++ show (length l)
+        
+        handler (HT.Status code reason) _ = do
+            body <- bsSink
+            return $ Left $ "non-200 response from Dropbox (" ++ (show code) ++ ":" ++ (BS8.unpack reason) ++ ": " ++ (show body) ++ ")"
 
--- |Add a file.  If a file already exists at the given path, that file will
--- be overwritten.  If successful, you'll get back the metadata for your
--- newly-uploaded file.
-forceFile ::
-    HE.Manager     -- ^The 'Network.HTTP.Enumerator.Manager' to use.
+-- |A variant of 'getFile' that just returns a strict 'ByteString' (instead of having
+-- you pass in a 'Sink' to process the body.
+getFileBs ::
+    (MonadBaseControl IO m, MonadThrow m, MonadUnsafeIO m, MonadIO m) 
+    => Manager               -- ^The HTTP connection manager to use.
     -> Session
-    -> Path        -- ^The full path (relative to your 'DbAccessType' root)
-    -> RequestBody -- ^The file contents.
-    -> IO (Either ErrorMessage Meta)
-forceFile mgr session path contents = putFile mgr session path contents [("overwrite", "true")]
+    -> Path                  -- ^The full path (relative to your 'DbAccessType' root)
+    -> Maybe FileRevision    -- ^The revision of the file to retrieve.
+    -> m (Either ErrorMessage (Meta, ByteString))
+getFileBs mgr session path mrev = getFile mgr session path mrev (\_ -> bsSink)
 
 ----------------------------------------------------------------------
--- The underlying "put_file" call.
+-- putFile
+
+data WriteMode
+    = WriteModeAdd
+        -- ^If there is already a file at the specified path, rename the new file.
+    | WriteModeUpdate FileRevision
+        -- ^Check that there is a file there with the given revision.  If so, overwrite
+        -- it.  If not, rename the new file.
+    | WriteModeForce
+        -- ^If there is already a file at the specified path, overwrite it.
 
 putFile ::
-    HE.Manager
+    (MonadBaseControl IO m, MonadThrow m, MonadUnsafeIO m, MonadIO m) 
+    => Manager       -- ^The HTTP connection manager to use.
     -> Session
-    -> Path
-    -> RequestBody
-    -> [(String,String)]
-    -> IO (Either ErrorMessage Meta)
-putFile mgr session path contents params =
-    if "/" `isPrefixOf` path
-        then do
-            result <- doPut mgr session hostsApiContent url params contents (mkHandler handler)
-            return $ mergeLefts result
-        else return $ Left $ "path must start with \"/\""
+    -> Path          -- ^The full path (relative to your 'DbAccessType' root)
+    -> WriteMode
+    -> RequestBody m -- ^The file contents.
+    -> m (Either ErrorMessage Meta)
+putFile mgr session path writeMode contents = checkPath path $ do
+    result <- doPut mgr session hostsApiContent url params contents (mkHandler handler)
+    return $ mergeLefts result
     where
+        params = case writeMode of
+            WriteModeAdd -> [("overwrite", "false")]
+            WriteModeUpdate (FileRevision rev) -> [("parent_rev", rev)]
+            WriteModeForce -> [("overwrite", "true")]
         at = accessTypePath $ configAccessType (sessionConfig session)
         url = "files_put/" ++ at ++ path
         handler 200 _ body = handleJsonBody body
@@ -752,59 +670,78 @@ prepRequest (Session config (AccessToken atKey atSecret)) hostSelector path para
         oauthHeader = buildOAuthHeader consumerPair (atKey, atSecret)
 
 doPut ::
-    Manager
+    (MonadBaseControl IO m, MonadThrow m, MonadUnsafeIO m, MonadIO m) 
+    => Manager
     -> Session
     -> (Hosts -> String)
     -> String
     -> [(String,String)]
-    -> RequestBody
-    -> Handler r
-    -> IO (Either ErrorMessage r)
+    -> RequestBody m
+    -> Handler r m
+    -> m (Either ErrorMessage r)
 doPut mgr session hostSelector path params requestBody handler = do
     let (uri, oauthHeader) = prepRequest session hostSelector path params
-    let vf = certVerifierFunc $ configCertVerifier $ sessionConfig session
-    httpClientPut mgr vf uri oauthHeader handler requestBody
+    httpClientPut mgr uri oauthHeader handler requestBody
 
 doGet ::
-    Manager
+    (MonadBaseControl IO m, MonadThrow m, MonadUnsafeIO m, MonadIO m) 
+    => Manager
     -> Session
     -> (Hosts -> String)
     -> String
     -> [(String,String)]
-    -> Handler r
-    -> IO (Either ErrorMessage r)
+    -> Handler r m
+    -> m (Either ErrorMessage r)
 doGet mgr session hostSelector path params handler = do
     let (uri, oauthHeader) = prepRequest session hostSelector path params
-    let vf = certVerifierFunc $ configCertVerifier $ sessionConfig session
-    httpClientGet mgr vf uri oauthHeader handler
+    httpClientGet mgr uri oauthHeader handler
 
 ----------------------------------------------------------------------
 
-type Manager = HE.Manager
+-- |`ManagerSettings` that include the DropBox SSL certificates
+managerSettings :: (MonadBaseControl IO m) => m HC.ManagerSettings
+managerSettings = do 
+    return $ HC.def { HC.managerCheckCerts = certVerifierFunc certVerifierFromDbX509s }
 
-withManager :: (Manager -> IO r) -> IO r
-withManager = HE.withManager
+-- |The HTTP connection manager.  Using the same 'Manager' instance across
+-- multiple API calls 
+type Manager = HC.Manager
+
+-- |A bracket around an HTTP connection manager.
+-- Uses default 'ManagerSettings' as computed by 'managerSettings'.
+withManager ::
+    (MonadBaseControl IO m, MonadThrow m, MonadUnsafeIO m, MonadIO m)
+    => (HC.Manager -> ResourceT m a) -> m a
+withManager inner = runResourceT $ do
+    ms <- managerSettings
+    (_, manager) <- allocate (HC.newManager ms) HC.closeManager
+    inner manager
 
 ----------------------------------------------------------------------
 
 type SimpleHandler r = Int -> String -> ByteString -> r
 
--- |HTTP response-handling function.
-type Handler r = HT.Status -> HT.ResponseHeaders -> (Iteratee ByteString IO r)
+-- HTTP response-handling function.
+type Handler r m = HT.Status -> HT.ResponseHeaders -> (Sink ByteString (ResourceT m) r)
 
--- |An HTTP request body: an 'Int64' for the length and an 'Enumerator'
+-- |An HTTP request body: an 'Int64' for the length and a 'Source'
 -- that yields the actual data.
-data RequestBody = RequestBody Int64 (forall r. Enumerator ByteString IO r)
+data RequestBody m = RequestBody Int64 (Source (ResourceT m) ByteString)
 
 -- |Create a 'RequestBody' from a single 'ByteString'
-bsRequestBody :: ByteString -> RequestBody
-bsRequestBody bs = RequestBody length (E.enumLists [[bs]])
+bsRequestBody :: MonadIO m => ByteString -> RequestBody m
+bsRequestBody bs = RequestBody length (CL.sourceList [bs])
     where
         length = fromInteger $ toInteger $ BS.length bs
 
-mkHandler :: SimpleHandler r -> Handler r
+getHeaders :: HT.HeaderName -> [HT.Header] -> [ByteString]
+getHeaders name headers = [ val | (key, val) <- headers, key == name ]
+
+mkHandler ::
+    Monad m => SimpleHandler r 
+    -> Handler r m
 mkHandler sh (HT.Status code reason) _headers = do
-    bs <- bsIteratee
+    bs <- bsSink
     return $ sh code (BS8.unpack reason) bs
 
 mergeLefts :: Either a (Either a b) -> Either a b
@@ -812,40 +749,56 @@ mergeLefts v = case v of
     Left a -> Left a
     Right r -> r
 
--- |An 'Iteratee' that reads in 'ByteString' chunks and constructs one concatenated 'ByteString'
-bsIteratee :: Monad m => Iteratee ByteString m ByteString
-bsIteratee = do
-    chunks <- EL.consume
+-- |A 'Sink' that reads in 'ByteString' chunks and constructs one concatenated 'ByteString'
+bsSink :: (Monad m) => Sink ByteString m ByteString
+bsSink = do
+    chunks <- CL.consume
     return $ BS.concat chunks
 
+-- | Runs an http request with a given oauth header
 httpClientDo ::
-    Manager
-    -> HT.Ascii
-    -> RequestBody
-    -> CertVerifierFunc
+    (MonadBaseControl IO m, MonadThrow m, MonadUnsafeIO m, MonadIO m) 
+    => Manager
+    -> HT.Method
+    -> RequestBody m
     -> URL
     -> String
-    -> Handler r
-    -> IO (Either String r)
-httpClientDo mgr method (RequestBody len bsEnum) vf url oauthHeader handler =
-    case HE.parseUrl url of
+    -> Handler r m
+    -> m (Either String r)
+httpClientDo mgr method (RequestBody len bsSource) url oauthHeader handler =
+    case HC.parseUrl url of
         Just baseReq -> do
             let req = baseReq {
-                HE.secure = True,
-                HE.method = method,
-                HE.requestHeaders = headers,
-                HE.requestBody = HE.RequestBodyEnum len builderEnum,
-                HE.checkCerts = vf }
-            resp <- E.run_ $ HE.http req handler mgr
-            return $ Right resp
+                HC.secure = True,
+                HC.method = method,
+                HC.requestHeaders = headers,
+                HC.requestBody = HC.RequestBodySource len builderSource,
+                HC.checkStatus = \_ _ -> Nothing }
+            result <- runResourceT $ do
+                HC.Response code _ headers body <- HC.http req mgr
+                body $$+- handler code headers
+            return $ Right result
         Nothing -> do
             return $ Left $ "bad URL: " ++ show url
     where
         headers = [("Authorization", UTF8.fromString oauthHeader)]
-        builderEnum = E.joinE bsEnum (EL.map BlazeBS.fromByteString)
+        builderSource = bsSource $= (CL.map BlazeBS.fromByteString)
 
-httpClientGet :: Manager -> CertVerifierFunc -> URL -> String -> Handler r -> IO (Either String r)
-httpClientGet mgr vf url oauthHeader handler = httpClientDo mgr "GET" (bsRequestBody BS.empty) vf url oauthHeader handler
+httpClientGet ::
+    (MonadBaseControl IO m, MonadThrow m, MonadUnsafeIO m, MonadIO m) 
+    => Manager
+    -> URL
+    -> String
+    -> Handler r m
+    -> m (Either String r)
+httpClientGet mgr url oauthHeader handler = httpClientDo mgr HT.methodGet (bsRequestBody BS.empty) url oauthHeader handler
 
-httpClientPut :: Manager -> CertVerifierFunc -> URL -> String -> Handler r -> RequestBody -> IO (Either String r)
-httpClientPut mgr vf url oauthHeader handler requestBody = httpClientDo mgr "PUT" requestBody vf url oauthHeader handler
+httpClientPut ::
+    (MonadBaseControl IO m, MonadThrow m, MonadUnsafeIO m, MonadIO m) 
+    => Manager
+    -> URL
+    -> String
+    -> Handler r m
+    -> RequestBody m
+    -> m (Either String r)
+httpClientPut mgr url oauthHeader handler requestBody = httpClientDo mgr HT.methodPut requestBody url oauthHeader handler

@@ -1,2 +1,10 @@
-#
+# "cabal build" output directories
+/dist
+/Examples/dist
+
+/.cabal-sandbox
+/cabal.sandbox.config
+/cabal-dev
+
+# Other junk
 *DS_Store*

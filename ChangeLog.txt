@@ -1,0 +1,23 @@
+0.3.1
+
+- (Fix build) Include "trusted-certs.crt" in source [Tim Baumann].
+
+0.3.0
+
+- Combine addFile/forceFile/updateFile into a single putFile function.
+- Replace hardcoded use of IO with type constraints [Lars Kuhtz].
+- Update to lastest libs, notably conduit/http-conduit [Lars Kuhtz].
+- Load "trusted-certs.txt" at compile time using TH [Lars Kuhtz].
+
+0.2.0
+
+- New API call 'getFile' to download file from Dropbox [Tim Baumann].
+- Switch from Data.Enumerator to Data.Conduit.
+
+0.1.1
+
+- Allow JSON 0.5.x (in addition to 0.4.x)
+
+0.1.0
+
+- Initial release.
